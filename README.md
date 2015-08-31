@@ -8,7 +8,7 @@ Components I am using now:
 - DHT22 (humidity sensor)
 - GY-65 (BMP085, barometric sensor)
 - DS18B20 (temperature sensor)
-- an LDR
+- LDR
 - PIR motion detection sensor
 - 433Mhz transmitter
 
