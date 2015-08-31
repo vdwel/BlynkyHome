@@ -11,6 +11,7 @@
 #include "DHT.h"
 #include <SFE_BMP180.h>
 #include <Wire.h>
+#include <ArduinoJson.h>
 
 //#define HOME //uncomment for home server
 #define DHTPIN 0 
@@ -22,7 +23,7 @@
 #define SID  "...."
 #define PAS  "...."
 #define HOMESERVER  "x.x.x.x"
-#define thingspeakAPIkey "...."
+#define thingspeakAPIkey "XXXX"
 #define movementPIN 10
 #define MOVEMENT_TIMEOUT 600000
 #define LIGHT_TRESHOLD 300
@@ -40,9 +41,9 @@
 #define VERSION "Lights version 0.02"
 
 #ifdef HOME
-#define AUTH "...."
+#define AUTH "XXXX"
 #else
-#define AUTH "...."
+#define AUTH "XXXX"
 #endif
 
 //Mode 0: licht uit
@@ -65,7 +66,7 @@ SFE_BMP180 pressure;
 DHT dht(DHTPIN, DHTTYPE);
 
 ESP8266WebServer server(80);
-const char* serverIndex = "Version 0.02<br><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
+const char* serverIndex = "Version 0.01<br><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
 
 
 void connectWiFi(const char* ssid = SID, const char* pass = PAS, int timeout = 10);
@@ -442,7 +443,7 @@ void interruptHandler()
 void startWebServer(){
     if(WiFi.waitForConnectResult() == WL_CONNECTED){
     MDNS.begin(HOSTNAME);
-    server.on("/", HTTP_GET, [](){
+    server.on("/update", HTTP_GET, [](){
       server.sendHeader("Connection", "close");
       server.sendHeader("Access-Control-Allow-Origin", "*");
       server.send(200, "text/html", serverIndex);
@@ -473,6 +474,15 @@ void startWebServer(){
       }
       yield();
     });
+    server.on ( "/", handleSensorData );
+    server.on ( "/on", HTTP_GET, [](){
+      licht_aan();
+      server.send(200, "text/plain", "Lights on!!");
+    });
+    server.on ( "/off", HTTP_GET, [](){
+      licht_uit();
+      server.send(200, "text/plain", "Lights off!!");
+    });
     server.on("/update", HTTP_POST, [](){
       server.sendHeader("Connection", "close");
       server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -486,6 +496,19 @@ void startWebServer(){
   } else {
     Serial.println("WiFi Failed");
   }
+}
+
+void handleSensorData() {
+  char sensorData[256];
+  StaticJsonBuffer<200> jsonBuffer;
+  JsonObject& json = jsonBuffer.createObject();
+  json["Temperature"] = temperature;
+  json["Humidity"] = hum; 
+  json["Pressure"] = bar;
+  json["ambientLight"] = ambientLight;
+
+  json.prettyPrintTo(sensorData, sizeof(sensorData));
+  server.send ( 200, "text/html", sensorData );
 }
 
 void switchKaku(int pin, unsigned long id, int dev, int repeat, bool state){
