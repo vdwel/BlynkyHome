@@ -1,3 +1,10 @@
+/*
+ * To do:
+ * Storage of light treshold
+ * Storage and interface for configuration
+ * Initial configuration, first time switch on, enter basestation if no connection for longer period after reboot.
+ */
+
 #define BLYNK_PRINT Serial    // Comment this out to disable prints and save space
 
 #include <ESP8266WiFi.h>
@@ -12,8 +19,13 @@
 #include <SFE_BMP180.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+#include <switchKaKu.h>
+#include <EEPROM.h>
 
 //#define HOME //uncomment for home server
+#define ADDR_KITCHEN 0 //EEPROM adress for kitchen light intensity
+#define ADDR_HALL 4
+#define ADDR_LIGHTTRESHOLD 8
 #define DHTPIN 0 
 #define DHTTYPE DHT21
 #define ALTITUDE 0.0
@@ -22,11 +34,10 @@
 #define temperaturePIN 12
 #define SID  "...."
 #define PAS  "...."
-#define HOMESERVER  "x.x.x.x"
-#define thingspeakAPIkey "XXXX"
-#define movementPIN 10
+#define HOMESERVER  "X.X.X.X"
+#define thingspeakAPIkey "...."
+#define movementPIN 2
 #define MOVEMENT_TIMEOUT 600000
-#define LIGHT_TRESHOLD 300
 #define SWITCH_MODE0 36000 //10:00
 #define SWITCH_MODE1 57600 //16:00
 #define SWITCH_MODE2 68400 //19:00
@@ -36,14 +47,15 @@
 #define KAKU_CHAN 'H'
 #define KAKU_DEV 1
 #define NEW_KAKU 1
-#define NEW_KAKU_TRANSMITTERID 3720271
+#define NEW_KAKU_TRANSMITTERID1 14881086
+#define NEW_KAKU_TRANSMITTERID2 10469306
 #define HOSTNAME "lights_dev"
-#define VERSION "Lights version 0.02"
+#define VERSION "BlynkyHome version 0.034"
 
 #ifdef HOME
-#define AUTH "XXXX"
+#define AUTH "...."
 #else
-#define AUTH "XXXX"
+#define AUTH "...."
 #endif
 
 //Mode 0: licht uit
@@ -59,14 +71,20 @@ OneWire  ds(temperaturePIN);
 int ambientLight;
 bool lightStatus = LOW;
 bool alarmArmed = LOW;
-int lightTreshold = LIGHT_TRESHOLD;
+int lightTreshold;
+int kitchenIntensity;
+int hallIntensity;
 KaKuSwitch kaKuSwitch(transmitterPIN);
 double bar, hum; 
 SFE_BMP180 pressure;
 DHT dht(DHTPIN, DHTTYPE);
+bool updating = 0;
+unsigned long updateStarted_time = 0;
+
+
 
 ESP8266WebServer server(80);
-const char* serverIndex = "Version 0.01<br><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
+const char* serverIndex = "BlynkyHome version 0.034<br><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
 
 
 void connectWiFi(const char* ssid = SID, const char* pass = PAS, int timeout = 10);
@@ -74,6 +92,10 @@ void connectWiFi(const char* ssid = SID, const char* pass = PAS, int timeout = 1
 void setup()
 {
   Serial.begin(115200);
+  EEPROM.begin(512);
+  EEPROM.get(ADDR_KITCHEN, kitchenIntensity);
+  EEPROM.get(ADDR_HALL, hallIntensity);
+  EEPROM.get(ADDR_LIGHTTRESHOLD, lightTreshold);
   connectWiFi();
   #ifdef HOME
   Blynk.config(AUTH, HOMESERVER);
@@ -100,12 +122,18 @@ void loop()
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
-  Blynk.run();
-  timer.run();
-  stateMachine();
   server.handleClient();
+  if (!updating){
+    Blynk.run();
+    timer.run();
+    stateMachine();
+  } else {
+      if ((millis() - updateStarted_time) > 300000){
+        updating = false;
+        attachInterrupt(digitalPinToInterrupt(movementPIN), interruptHandler, CHANGE);
+      }
+  }
 }
-
 
 void stateMachine()
 {
@@ -179,9 +207,33 @@ void stateMachine()
 
 
 void callBack(){
+  int oldHallIntensity;
+  EEPROM.get(ADDR_HALL, oldHallIntensity);
+  int oldKitchenIntensity;
+  EEPROM.get(ADDR_KITCHEN, oldKitchenIntensity);
+  int oldLightTreshold;
+  EEPROM.get(ADDR_LIGHTTRESHOLD, oldLightTreshold);
   static long counter = 0;
   static bool LEDstatus = HIGH;
   digitalWrite(LED, LEDstatus);
+  if (oldHallIntensity != hallIntensity){
+    if (lightStatus){
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 3, true, 3, hallIntensity);
+    }
+    EEPROM.put(ADDR_HALL, hallIntensity);
+    EEPROM.commit();
+  }
+  if (oldKitchenIntensity != kitchenIntensity){
+    if (lightStatus){
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 4, true, 3, kitchenIntensity);
+    }
+    EEPROM.put(ADDR_KITCHEN, kitchenIntensity);
+    EEPROM.commit();
+  }
+  if (oldLightTreshold != lightTreshold){
+    EEPROM.put(ADDR_LIGHTTRESHOLD, lightTreshold);
+    EEPROM.commit();
+  }  
   LEDstatus = !LEDstatus;
   counter += 1;
   if (counter > 1000) {
@@ -202,6 +254,12 @@ void callBack(){
   Blynk.virtualWrite(V28, alarmArmed); 
   Blynk.run();
   Blynk.virtualWrite(V0, lightStatus);
+  Blynk.run();
+  Blynk.virtualWrite(V11, kitchenIntensity);
+  Blynk.run();
+  Blynk.virtualWrite(V13, hallIntensity);
+  Blynk.run();
+  Blynk.virtualWrite(V25, lightTreshold);
   Blynk.run();
   //BLYNK_LOG("Ambient Light: %d", ambientLight);
 }
@@ -241,8 +299,16 @@ BLYNK_WRITE(29)
 BLYNK_WRITE(26)
 {
   lightTreshold = param[0].asInt();
-  Blynk.virtualWrite(V25, lightTreshold);
-  Blynk.run();
+}
+
+BLYNK_WRITE(10)
+{
+  kitchenIntensity = param[0].asInt();
+}
+
+BLYNK_WRITE(12)
+{
+  hallIntensity = param[0].asInt();
 }
 
 void readTemp()
@@ -252,8 +318,8 @@ void readTemp()
   int minutes = (epoch % 3600) / 60;
   int seconds = (epoch % 60);
   char timeString[8];
-  sprintf(timeString,"%02d:%02d:%02d",hours, minutes, seconds);
-  BLYNK_LOG("The time is %s", timeString);       // UTC is the time at Greenwich Meridian (GMT)
+  //sprintf(timeString,"%02d:%02d:%02d",hours, minutes, seconds);
+  //BLYNK_LOG("The time is %s", timeString);       // UTC is the time at Greenwich Meridian (GMT)
  
   byte i;
   byte present = 0;
@@ -263,15 +329,14 @@ void readTemp()
   float celsius, fahrenheit;
   
   if ( !ds.search(addr)) {
-    Serial.println("No more addresses.");
-    Serial.println();
+    BLYNK_LOG("No more addresses.");
     ds.reset_search();
     delay(250);
     return;
   }
   
   if (OneWire::crc8(addr, 7) != addr[7]) {
-//      Serial.println("CRC is not valid!");
+//      BLYNK_LOG("CRC is not valid!");
       return;
   }
  
@@ -326,8 +391,6 @@ void readTemp()
   }
   celsius = (float)raw / 16.0;
   fahrenheit = celsius * 1.8 + 32.0;
-  Serial.print("  Temperature = ");
-  Serial.println(celsius);
   Blynk.virtualWrite(V1, celsius);
   temperature = celsius;
   ds.reset_search();
@@ -374,35 +437,37 @@ void connectWiFi(const char* ssid, const char* pass, int timeout)
 }
 
 void licht_aan() {
-  Blynk.virtualWrite(V30, HIGH);
-  Blynk.run();
-  lightStatus = HIGH; 
-  for ( int i = 0; i <= 1; i++){
+  if (!lightStatus){
+    Blynk.virtualWrite(V30, HIGH);
+    Blynk.run();
+    lightStatus = HIGH; 
     if (NEW_KAKU){
-//      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, 0, 3, true); //switch device 0, repeat 3, on
-//      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, 1, 3, true); //switch device 1, repeat 3, on 
-      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, -1, 3, true); //switch group, repeat 3, on
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID1, 1, -1, true, 3); //switch group 1, entire group, repeat 3, on
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 4, true, 3, kitchenIntensity); //switch group 1, device 4, dimlevel 4 (max 15), repeat 3, on
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 3, true, 3, hallIntensity); //switch group 1, device 3, dimlevel 3 (max 15), repeat 3, on
     } else {
       kaKuSwitch.sendSignal(KAKU_CHAN,KAKU_DEV,true);
     }
+    Blynk.virtualWrite(V30, LOW);
+    Blynk.run();
   }
-  Blynk.virtualWrite(V30, LOW);
-  Blynk.run();
 }
 
 void licht_uit() {
-  Blynk.virtualWrite(V30, HIGH);
-  Blynk.run();
-  lightStatus = LOW;
+  if (lightStatus){
+    Blynk.virtualWrite(V30, HIGH);
+    Blynk.run();
+    lightStatus = LOW;
     if (NEW_KAKU){
-//      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, 0, 3, false);
-//      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, 1, 3, false);
-      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID, -1, 3, false);
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID1, 1, -1, false, 3);
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 4, false, 3);
+      switchKaku(transmitterPIN, NEW_KAKU_TRANSMITTERID2, 1, 3, false, 3);
     } else {
       kaKuSwitch.sendSignal(KAKU_CHAN,KAKU_DEV,false);
     }
-  Blynk.virtualWrite(V30, LOW);
-  Blynk.run();
+    Blynk.virtualWrite(V30, LOW);
+    Blynk.run();
+  }
 }
 
 void updateThingspeak(String APIkey, String tsData)
@@ -411,7 +476,7 @@ void updateThingspeak(String APIkey, String tsData)
     const int httpPort = 80;
 //if (!client.connect("api.thingspeak.com", httpPort)) {
   if (!client.connect("184.106.153.149", httpPort)) {
-      Serial.println("connection to thingspeak failed");
+      BLYNK_LOG("connection to thingspeak failed");
       return;
     }
     
@@ -434,7 +499,7 @@ void interruptHandler()
  unsigned long interrupt_time = millis();
  if (interrupt_time - last_interrupt_time > 2000)
  {
-  BLYNK_LOG("movement detected");
+  Serial.printf("movement detected\n");
   movementDetected = 1;
  }
  last_interrupt_time = interrupt_time;
@@ -443,14 +508,21 @@ void interruptHandler()
 void startWebServer(){
     if(WiFi.waitForConnectResult() == WL_CONNECTED){
     MDNS.begin(HOSTNAME);
+    server.on("/reboot", HTTP_GET,[](){
+      server.send(200, "text/plain", "Rebooting!!");
+      ESP.restart();
+    });
     server.on("/update", HTTP_GET, [](){
       server.sendHeader("Connection", "close");
       server.sendHeader("Access-Control-Allow-Origin", "*");
       server.send(200, "text/html", serverIndex);
+      updating = true;
+      updateStarted_time = millis();
+      detachInterrupt(digitalPinToInterrupt(movementPIN));
     });
     server.onFileUpload([](){
       if(server.uri() != "/update") return;
-      detachInterrupt(digitalPinToInterrupt(movementPIN));
+      //detachInterrupt(digitalPinToInterrupt(movementPIN));
       HTTPUpload& upload = server.upload();
       if(upload.status == UPLOAD_FILE_START){
         Serial.setDebugOutput(true);
@@ -494,7 +566,7 @@ void startWebServer(){
   
     Serial.printf("Ready! Open http://%s.local in your browser\n", HOSTNAME);
   } else {
-    Serial.println("WiFi Failed");
+    Serial.printf("WiFi Failed");
   }
 }
 
@@ -511,61 +583,6 @@ void handleSensorData() {
   server.send ( 200, "text/html", sensorData );
 }
 
-void switchKaku(int pin, unsigned long id, int dev, int repeat, bool state){
-  if (dev == -1){
-    dev = 1<<5;
-  }
-  sendKakuCode(pin, (((id<<8|dev)|state<<4)|1<<7), repeat);  
-}
-
-void sendKakuCode(int pin, unsigned long code, int repeat){
-  int period = 230;
-  pinMode(pin, OUTPUT);
-  Serial.print("Sending code: ");
-  Serial.println(code);
-  for (int j = 0; j < repeat; j++){
-    //Send sync
-    digitalWrite(pin, LOW);
-    delayMicroseconds(47*period);
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(period*12);
-    //Send code  
-    for (int i = 31; i>=0; i--){
-      sendBit(code & (1<<i), pin, period);
-    }
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);    
-    digitalWrite(pin, LOW);
-    //Serial.println("");
-  }
-}
-
-void sendBit(int value, int pin, int period){
-  if (value == 0){
-    //Serial.print(0);
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(period*1.4);
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(period*6);
-  } else {
-    //Serial.print(1);
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(period*6);
-    digitalWrite(pin,HIGH);
-    delayMicroseconds(period);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(period*1.4);
-    
-  }
-}
 
 void readHumiditySensor()
 {
@@ -574,7 +591,7 @@ void readHumiditySensor()
   float f = dht.readTemperature(true);
 
   if (isnan(h) || isnan(t) || isnan(f)) {
-    Serial.println("Failed to read from DHT sensor!");
+    BLYNK_LOG("Failed to read from DHT sensor!");
     return;
   }
 
@@ -582,19 +599,6 @@ void readHumiditySensor()
   float hif = dht.computeHeatIndex(f, h);
   // Compute heat index in Celsius (isFahreheit = false)
   float hic = dht.computeHeatIndex(t, h, false);
-  Serial.print("Humidity: ");
-  Serial.print(h);
-  Serial.print(" %\t");
-  Serial.print("Temperature: ");
-  Serial.print(t);
-  Serial.print(" *C ");
-  Serial.print(f);
-  Serial.print(" *F\t");
-  Serial.print("Heat index: ");
-  Serial.print(hic);
-  Serial.print(" *C ");
-  Serial.print(hif);
-  Serial.println(" *F");
   Blynk.virtualWrite(V5, h);
   Blynk.run();
   Blynk.virtualWrite(V6, t);
@@ -614,12 +618,6 @@ void readPressure()
   // We're using a constant called ALTITUDE in this sketch:
   
 
-  Serial.print("provided altitude: ");
-  Serial.print(ALTITUDE,0);
-  Serial.print(" meters, ");
-  Serial.print(ALTITUDE*3.28084,0);
-  Serial.println(" feet");
-  
   // If you want to measure altitude, and not pressure, you will instead need
   // to provide a known baseline pressure. This is shown at the end of the sketch.
 
@@ -642,13 +640,6 @@ void readPressure()
     status = pressure.getTemperature(T);
     if (status != 0)
     {
-      // Print out the measurement:
-      Serial.print("temperature: ");
-      Serial.print(T,2);
-      Serial.print(" deg C, ");
-      Serial.print((9.0/5.0)*T+32.0,2);
-      Serial.println(" deg F");
-      
       // Start a pressure measurement:
       // The parameter is the oversampling setting, from 0 to 3 (highest res, longest wait).
       // If request is successful, the number of ms to wait is returned.
@@ -669,13 +660,6 @@ void readPressure()
         status = pressure.getPressure(P,T);
         if (status != 0)
         {
-          // Print out the measurement:
-          Serial.print("absolute pressure: ");
-          Serial.print(P,2);
-          Serial.print(" mb, ");
-          Serial.print(P*0.0295333727,2);
-          Serial.println(" inHg");
-
           // The pressure sensor returns abolute pressure, which varies with altitude.
           // To remove the effects of altitude, use the sealevel function and your current altitude.
           // This number is commonly used in weather reports.
@@ -683,32 +667,20 @@ void readPressure()
           // Result: p0 = sea-level compensated pressure in mb
 
           p0 = pressure.sealevel(P,ALTITUDE); // we're at 1655 meters (Boulder, CO)
-          Serial.print("relative (sea-level) pressure: ");
-          Serial.print(p0,2);
-          Serial.print(" mb, ");
-          Serial.print(p0*0.0295333727,2);
-          Serial.println(" inHg");
-
           // On the other hand, if you want to determine your altitude from the pressure reading,
           // use the altitude function along with a baseline pressure (sea-level or other).
           // Parameters: P = absolute pressure in mb, p0 = baseline pressure in mb.
           // Result: a = altitude in m.
 
           a = pressure.altitude(P,p0);
-          Serial.print("computed altitude: ");
-          Serial.print(a,0);
-          Serial.print(" meters, ");
-          Serial.print(a*3.28084,0);
-          Serial.println(" feet");
         }
-        else Serial.println("error retrieving pressure measurement\n");
+        else Serial.println("error retrieving pressure measurement");
       }
-      else Serial.println("error starting pressure measurement\n");
+      else Serial.println("error starting pressure measurement");
     }
-    else Serial.println("error retrieving temperature measurement\n");
+    else Serial.println("error retrieving temperature measurement");
   }
-  else Serial.println("error starting temperature measurement\n");
-  Serial.println();
+  else Serial.println("error starting temperature measurement");
   Blynk.virtualWrite(V9, int(p0)); 
   Blynk.run();
   bar = p0;
