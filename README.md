@@ -15,3 +15,5 @@ Components I am using now:
 Designed and ordered a PCB to make everything nice. :-)
 
 More to come!! 
+
+![alt tag](https://github.com/vdwel/BlynkyHome/blob/master/BlynkyHome.jpg?raw=true)
