@@ -1,8 +1,28 @@
 /*
  * To do:
- * Storage of light treshold
  * Storage and interface for configuration
  * Initial configuration, first time switch on, enter basestation if no connection for longer period after reboot.
+ *   V2 = uptime
+ *   V8 = LEDstatus
+ *   V7 = counter
+ *   V3 = ambientLight
+ *   V4 = currentMode
+ *   V5 = Humidity
+ *   V6 = Temp from humidity sensor
+ *   V9 = Pressure
+ *   V28 = alarmArmed
+ *   V0 = lightStatus
+ *   V11 = kitchenIntensity
+ *   V13 = hallIntensity
+ *   V25 =lightTreshold
+ *   V1 = temperature
+ *   V30 = busy
+ *   V31 = Mode change
+ *   V27 = Arm Alarm
+ *   V29 = Toggle light
+ *   V26 = Light Treshold slider
+ *   V10 = Kitchen intensity
+ *   V12 = Hall intensity
  */
 
 #define BLYNK_PRINT Serial    // Comment this out to disable prints and save space
@@ -21,6 +41,8 @@
 #include <ArduinoJson.h>
 #include <switchKaKu.h>
 #include <EEPROM.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <ArduinoOTA.h>
 
 //#define HOME //uncomment for home server
 #define ADDR_KITCHEN 0 //EEPROM adress for kitchen light intensity
@@ -43,14 +65,14 @@
 #define SWITCH_MODE2 68400 //19:00
 #define SWITCH_MODE3 84600 //23:30
 #define TIMEZONE 1
-#define DAYLIGHTSAVINGTIME 1
+#define DAYLIGHTSAVINGTIME 0
 #define KAKU_CHAN 'H'
 #define KAKU_DEV 1
 #define NEW_KAKU 1
 #define NEW_KAKU_TRANSMITTERID1 14881086
 #define NEW_KAKU_TRANSMITTERID2 10469306
-#define HOSTNAME "lights_dev"
-#define VERSION "BlynkyHome version 0.034"
+#define HOSTNAME "lights"
+#define VERSION "0.042"
 
 #ifdef HOME
 #define AUTH "...."
@@ -84,10 +106,22 @@ unsigned long updateStarted_time = 0;
 
 
 ESP8266WebServer server(80);
-const char* serverIndex = "BlynkyHome version 0.034<br><form method='POST' action='/update' enctype='multipart/form-data'><input type='file' name='update'><input type='submit' value='Update'></form>";
-
+ESP8266HTTPUpdateServer httpUpdater;
 
 void connectWiFi(const char* ssid = SID, const char* pass = PAS, int timeout = 10);
+void callBack();
+void readTemp();
+void readHumiditySensor();
+void readPressure();
+void periodicUpdateThingspeak();
+void interruptHandler();
+void startWebServer();
+void handleSensorData();
+void stateMachine();
+void licht_uit();
+void licht_aan();
+void updateThingspeak(String APIkey, String tsData);
+void handleRoot();
 
 void setup()
 {
@@ -111,10 +145,39 @@ void setup()
   pinMode(LED, OUTPUT);
   pinMode(transmitterPIN, OUTPUT);
   pinMode(movementPIN, INPUT_PULLUP);
+  pinMode(temperaturePIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(movementPIN), interruptHandler, CHANGE);
   ambientLight = analogRead(A0);
   pressure.begin();
   startWebServer();
+
+  // Port defaults to 8266
+  // ArduinoOTA.setPort(8266);
+
+  // Hostname defaults to esp8266-[ChipID]
+  ArduinoOTA.setHostname(HOSTNAME);
+
+  // No authentication by default
+  // ArduinoOTA.setPassword((const char *)"123");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("End");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\n", (progress / (total / 100)));
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+  ArduinoOTA.begin();
 }
 
 void loop()
@@ -123,10 +186,13 @@ void loop()
     connectWiFi();
   }
   server.handleClient();
+  ArduinoOTA.handle();
   if (!updating){
     Blynk.run();
     timer.run();
+    Blynk.run();
     stateMachine();
+    Blynk.run();
   } else {
       if ((millis() - updateStarted_time) > 300000){
         updating = false;
@@ -243,7 +309,7 @@ void callBack(){
   ambientLight = analogRead(A0);
   Blynk.virtualWrite(V2, uptime);
   Blynk.run();
-  Blynk.virtualWrite(V8, LEDstatus);
+  Blynk.virtualWrite(V8, LEDstatus*255);
   Blynk.run();
   Blynk.virtualWrite(V7, counter);
   Blynk.run();
@@ -251,9 +317,9 @@ void callBack(){
   Blynk.run();
   Blynk.virtualWrite(V4, currentMode);
   Blynk.run();
-  Blynk.virtualWrite(V28, alarmArmed); 
+  Blynk.virtualWrite(V28, alarmArmed*255); 
   Blynk.run();
-  Blynk.virtualWrite(V0, lightStatus);
+  Blynk.virtualWrite(V0, lightStatus*255);
   Blynk.run();
   Blynk.virtualWrite(V11, kitchenIntensity);
   Blynk.run();
@@ -261,7 +327,8 @@ void callBack(){
   Blynk.run();
   Blynk.virtualWrite(V25, lightTreshold);
   Blynk.run();
-  //BLYNK_LOG("Ambient Light: %d", ambientLight);
+  Blynk.virtualWrite(V1, temperature);
+  Blynk.run();
 }
 
 void notifyUptime()
@@ -269,7 +336,6 @@ void notifyUptime()
   long uptime = millis() / 60000L;
   Blynk.notify(String("Running for ") + uptime + " minutes.");
 }
-
 
 BLYNK_WRITE(31)
 {
@@ -391,10 +457,8 @@ void readTemp()
   }
   celsius = (float)raw / 16.0;
   fahrenheit = celsius * 1.8 + 32.0;
-  Blynk.virtualWrite(V1, celsius);
   temperature = celsius;
   ds.reset_search();
-  Blynk.virtualWrite(V25, lightTreshold); //update this every 15 seconds
 }
 
 void periodicUpdateThingspeak()
@@ -438,7 +502,7 @@ void connectWiFi(const char* ssid, const char* pass, int timeout)
 
 void licht_aan() {
   if (!lightStatus){
-    Blynk.virtualWrite(V30, HIGH);
+    Blynk.virtualWrite(V30, 255);
     Blynk.run();
     lightStatus = HIGH; 
     if (NEW_KAKU){
@@ -448,14 +512,14 @@ void licht_aan() {
     } else {
       kaKuSwitch.sendSignal(KAKU_CHAN,KAKU_DEV,true);
     }
-    Blynk.virtualWrite(V30, LOW);
+    Blynk.virtualWrite(V30, 0);
     Blynk.run();
   }
 }
 
 void licht_uit() {
   if (lightStatus){
-    Blynk.virtualWrite(V30, HIGH);
+    Blynk.virtualWrite(V30, 255);
     Blynk.run();
     lightStatus = LOW;
     if (NEW_KAKU){
@@ -465,7 +529,7 @@ void licht_uit() {
     } else {
       kaKuSwitch.sendSignal(KAKU_CHAN,KAKU_DEV,false);
     }
-    Blynk.virtualWrite(V30, LOW);
+    Blynk.virtualWrite(V30, 0);
     Blynk.run();
   }
 }
@@ -507,60 +571,25 @@ void interruptHandler()
 
 void startWebServer(){
     if(WiFi.waitForConnectResult() == WL_CONNECTED){
-    MDNS.begin(HOSTNAME);
     server.on("/reboot", HTTP_GET,[](){
       server.send(200, "text/plain", "Rebooting!!");
       ESP.restart();
     });
-    server.on("/update", HTTP_GET, [](){
-      server.sendHeader("Connection", "close");
-      server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.send(200, "text/html", serverIndex);
-      updating = true;
-      updateStarted_time = millis();
-      detachInterrupt(digitalPinToInterrupt(movementPIN));
-    });
-    server.onFileUpload([](){
-      if(server.uri() != "/update") return;
-      //detachInterrupt(digitalPinToInterrupt(movementPIN));
-      HTTPUpload& upload = server.upload();
-      if(upload.status == UPLOAD_FILE_START){
-        Serial.setDebugOutput(true);
-        WiFiUDP::stopAll();
-        Serial.printf("Update: %s\n", upload.filename.c_str());
-        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-        if(!Update.begin(maxSketchSpace)){//start with max available size
-          Update.printError(Serial);
-        }
-      } else if(upload.status == UPLOAD_FILE_WRITE){
-        if(Update.write(upload.buf, upload.currentSize) != upload.currentSize){
-          Update.printError(Serial);
-        }
-      } else if(upload.status == UPLOAD_FILE_END){
-        if(Update.end(true)){ //true to set the size to the current progress
-          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-        } else {
-          Update.printError(Serial);
-        }
-        Serial.setDebugOutput(false);
-      }
-      yield();
-    });
-    server.on ( "/", handleSensorData );
+    server.on ( "/", handleRoot );
+    server.on ( "/licht.html", handleRoot );
+    server.on ( "/data", handleSensorData );
     server.on ( "/on", HTTP_GET, [](){
       licht_aan();
       server.send(200, "text/plain", "Lights on!!");
+    });
+    server.on("/version", HTTP_GET, [](){
+      server.send ( 200, "text/html", VERSION );
     });
     server.on ( "/off", HTTP_GET, [](){
       licht_uit();
       server.send(200, "text/plain", "Lights off!!");
     });
-    server.on("/update", HTTP_POST, [](){
-      server.sendHeader("Connection", "close");
-      server.sendHeader("Access-Control-Allow-Origin", "*");
-      server.send(200, "text/plain", (Update.hasError())?"FAIL":"OK");
-      ESP.restart();
-    });
+    httpUpdater.setup(&server);
     server.begin();
     MDNS.addService("http", "tcp", 80);
   
@@ -684,6 +713,82 @@ void readPressure()
   Blynk.virtualWrite(V9, int(p0)); 
   Blynk.run();
   bar = p0;
+}
+
+void handleRoot() {
+  char page[2500];
+
+  if (server.hasArg("keuken") && server.hasArg("gang")) {
+    kitchenIntensity = server.arg("keuken").toInt();
+    hallIntensity = server.arg("gang").toInt();
+  }
+
+  if (server.hasArg("button")) {
+    Serial.println(server.arg("button"));
+    if (server.arg("button") == "Licht aan") {
+      licht_aan();
+    }
+    if (server.arg("button") == "Licht uit") {
+      licht_uit();
+    }
+  }
+
+  snprintf ( page, 2500,
+
+             "<!DOCTYPE html>\n\
+<html>\n\
+<head>\n\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+<link rel=\"stylesheet\" href=\"http://code.jquery.com/mobile/1.4.5/jquery.mobile-1.4.5.min.css\">\n\
+<script src=\"http://code.jquery.com/jquery-1.11.3.min.js\"></script>\n\
+<script src=\"http://code.jquery.com/mobile/1.4.5/jquery.mobile-1.4.5.min.js\"></script>\n\
+</head>\n\
+<style type=\"text/css\">\n\
+    .ui-header .ui-title {margin: 0 10%}\n\
+</style>\n\
+<body>\n\
+<div data-role=\"page\">\n\
+  <div data-role=\"header\">\n\
+    <h1>Huis automatisering V%s</h1>\n\
+  </div>\n\
+  <div data-role=\"main\" class=\"ui-content\">\n\
+    <form method=\"post\" action=\"licht.html\">\n\
+      <label for=\"keuken\">Keuken dimmer</label>\n\
+      <input type=\"range\" name=\"keuken\" id=\"keuken\" value=\"%d\" min=\"0\" max=\"15\">\n\
+      <label for=\"gang\">Gang dimmer</label>\n\
+      <input type=\"range\" name=\"gang\" id=\"gang\" value=\"%d\" min=\"0\" max=\"15\">\n\
+      <input type=\"submit\" data-inline=\"true\" name=\"button\" value=\"Licht aan\">\n\
+      <input type=\"submit\" data-inline=\"true\" name=\"button\" value=\"Licht uit\">\n\
+    </form>\n\
+  </div>\n\
+  <div data-role=\"main\" class=\"ui-content\">\n\
+  <text id=\"time\"></text><br><br>\n\
+  Temperatuur: <text id=\"temperatureField\"></text> C<br>\n\
+  Luchtdruk: <text id=\"pressureField\"></text> mb<br>\n\
+  Luchtvochtigheid: <text id=\"humidityField\"></text><br>\n\
+  Omgevingslicht: <text id=\"ambientLightField\"></text><br>\n\
+  </div>\n\
+</div>\n\
+<script>\n\
+setInterval(getData, 10000);\n\
+function getData() {\n\
+        $.getJSON(\"http://%s.local/data\", function(data){\n\
+            var d = new Date();\n\
+            document.getElementById(\"time\").innerHTML=d;\n\
+            document.getElementById(\"temperatureField\").innerHTML=data[\"Temperature\"];\n\
+            document.getElementById(\"humidityField\").innerHTML=data[\"Humidity\"];\n\
+            document.getElementById(\"pressureField\").innerHTML=data[\"Pressure\"];\n\
+            document.getElementById(\"ambientLightField\").innerHTML=data[\"ambientLight\"];\n\
+        });\n\
+}\n\
+getData();\n\
+</script>\n\
+</body>\n\
+</html>", VERSION, kitchenIntensity, hallIntensity, HOSTNAME
+           );
+
+
+  server.send ( 200, "text/html", page );
 }
 
 
